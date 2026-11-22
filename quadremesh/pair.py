@@ -31,6 +31,90 @@ network access, standard library only.
 EPS = 1e-9
 
 
+# ---------------------------------------------------------------------------
+# small vector helpers
+# ---------------------------------------------------------------------------
+
+
+def _sub(p, q):
+    return (p[0] - q[0], p[1] - q[1], p[2] - q[2])
+
+
+def _cross(u, v):
+    return (
+        u[1] * v[2] - u[2] * v[1],
+        u[2] * v[0] - u[0] * v[2],
+        u[0] * v[1] - u[1] * v[0],
+    )
+
+
+def _dot(u, v):
+    return u[0] * v[0] + u[1] * v[1] + u[2] * v[2]
+
+
+def _length(v):
+    return _dot(v, v) ** 0.5
+
+
+def _unit(v):
+    n = _length(v)
+    if n <= EPS:
+        return (0.0, 0.0, 0.0)
+    return (v[0] / n, v[1] / n, v[2] / n)
+
+
+def _clamp(x, lo=0.0, hi=1.0):
+    return lo if x < lo else hi if x > hi else x
+
+
+def _face_normal(p):
+    return _unit(_cross(_sub(p[1], p[0]), _sub(p[2], p[0])))
+
+
+def _newell(points):
+    nx = ny = nz = 0.0
+    n = len(points)
+    for i in range(n):
+        a = points[i]
+        b = points[(i + 1) % n]
+        nx += (a[1] - b[1]) * (a[2] + b[2])
+        ny += (a[2] - b[2]) * (a[0] + b[0])
+        nz += (a[0] - b[0]) * (a[1] + b[1])
+    return (nx, ny, nz)
+
+
+def _edge_key(i, j):
+    return (i, j) if i <= j else (j, i)
+
+
+def _shared_edge(a, b):
+    """Return ``(apex_a, u, apex_b, v)`` for the shared edge of ``a``/``b``.
+
+    ``(u, v)`` is the shared edge in the direction ``a`` traverses it.  Returns
+    ``None`` when the triangles do not share exactly one undirected edge.
+    """
+    va, vb = a["v"], b["v"]
+    shared = set(va) & set(vb)
+    if len(shared) != 2:
+        return None
+    u = v = None
+    for c in range(3):
+        i, j = va[c], va[(c + 1) % 3]
+        if i in shared and j in shared:
+            u, v = i, j
+            break
+    if u is None:
+        return None
+    apex_a = next(x for x in va if x not in shared)
+    apex_b = next(x for x in vb if x not in shared)
+    return apex_a, u, apex_b, v
+
+
+# ---------------------------------------------------------------------------
+# adjacency
+# ---------------------------------------------------------------------------
+
+
 def build_adjacency(tris) -> dict:
     """Return the undirected edge -> incident triangle indices map.
 
@@ -53,7 +137,18 @@ def build_adjacency(tris) -> dict:
 
     Conventions: half-edge keys are ``(min, max)``, tolerance 1e-9.
     """
-    raise NotImplementedError("build_adjacency is not implemented")
+    incidence = {}
+    for t, tri in enumerate(tris):
+        v = tri["v"]
+        for c in range(3):
+            key = _edge_key(v[c], v[(c + 1) % 3])
+            incidence.setdefault(key, []).append(t)
+    return {key: tuple(sorted(ts)) for key, ts in incidence.items()}
+
+
+# ---------------------------------------------------------------------------
+# scoring
+# ---------------------------------------------------------------------------
 
 
 def pair_score(a, b) -> float:
@@ -83,7 +178,34 @@ def pair_score(a, b) -> float:
 
     Conventions: half-edge keys are ``(min, max)``, tolerance 1e-9.
     """
-    raise NotImplementedError("pair_score is not implemented")
+    info = _shared_edge(a, b)
+    if info is None:
+        return 0.0
+    apex_a, u, apex_b, v = info
+
+    pos = {}
+    for idx, p in zip(a["v"], a["p"]):
+        pos.setdefault(idx, p)
+    for idx, p in zip(b["v"], b["p"]):
+        pos.setdefault(idx, p)
+    quad_pts = [pos[apex_a], pos[u], pos[apex_b], pos[v]]
+
+    n_a = _face_normal(a["p"])
+    n_b = _face_normal(b["p"])
+    coplanar = _clamp(0.5 * (1.0 + _dot(n_a, n_b)))
+
+    area = 0.5 * _length(_newell(quad_pts))
+    longest = max(
+        _length(_sub(quad_pts[(i + 1) % 4], quad_pts[i])) for i in range(4)
+    )
+    shape = _clamp(area / (longest * longest)) if longest > EPS else 0.0
+
+    return 0.5 * coplanar + 0.5 * shape
+
+
+# ---------------------------------------------------------------------------
+# pairing
+# ---------------------------------------------------------------------------
 
 
 def pair_triangles(tris, adj, threshold) -> list[tuple]:
@@ -110,7 +232,38 @@ def pair_triangles(tris, adj, threshold) -> list[tuple]:
     Conventions: half-edge keys are ``(min, max)``, threshold is normalized to
     ``[0, 1]``, tolerance 1e-9.
     """
-    raise NotImplementedError("pair_triangles is not implemented")
+    threshold = _clamp(float(threshold))
+
+    candidates = []
+    for inc in adj.values():
+        if len(inc) != 2:
+            continue
+        i, j = inc
+        if i == j:
+            continue
+        if i > j:
+            i, j = j, i
+        score = pair_score(tris[i], tris[j])
+        if score >= threshold - EPS:
+            candidates.append((-score, i, j))
+    # Highest score first; ties broken by the smaller (i, j).
+    candidates.sort()
+
+    used = set()
+    pairs = []
+    for _neg_score, i, j in candidates:
+        if i in used or j in used:
+            continue
+        used.add(i)
+        used.add(j)
+        pairs.append((i, j))
+    pairs.sort()
+    return pairs
+
+
+# ---------------------------------------------------------------------------
+# merging
+# ---------------------------------------------------------------------------
 
 
 def merge_to_quad(a, b) -> tuple:
@@ -142,7 +295,23 @@ def merge_to_quad(a, b) -> tuple:
 
     Conventions: quad winding is counter-clockwise, tolerance 1e-9.
     """
-    raise NotImplementedError("merge_to_quad is not implemented")
+    info = _shared_edge(a, b)
+    if info is None:
+        raise ValueError("triangles must share exactly one undirected edge")
+    apex_a, u, apex_b, v = info
+
+    vb = b["v"]
+    traverses_vu = any(
+        vb[c] == v and vb[(c + 1) % 3] == u for c in range(3)
+    )
+    if not traverses_vu:
+        raise ValueError("triangles disagree on the front side (winding)")
+    return (apex_a, u, apex_b, v)
+
+
+# ---------------------------------------------------------------------------
+# leftovers
+# ---------------------------------------------------------------------------
 
 
 def fill_leftovers(quads, tris, adj) -> list:
@@ -165,7 +334,24 @@ def fill_leftovers(quads, tris, adj) -> list:
 
     Conventions: leftovers are ``(a, b, c, a)``, tolerance 1e-9.
     """
-    raise NotImplementedError("fill_leftovers is not implemented")
+    covered = [False] * len(tris)
+    for quad in quads:
+        corners = set(quad)
+        for t, tri in enumerate(tris):
+            if not covered[t] and set(tri["v"]) <= corners:
+                covered[t] = True
+
+    out = list(quads)
+    for t, tri in enumerate(tris):
+        if not covered[t]:
+            a, b, c = tri["v"]
+            out.append((a, b, c, a))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# seams
+# ---------------------------------------------------------------------------
 
 
 def preserve_seams(mesh, seams) -> dict:
@@ -193,7 +379,70 @@ def preserve_seams(mesh, seams) -> dict:
 
     Conventions: half-edge keys are ``(min, max)``, UV tolerance 1e-9.
     """
-    raise NotImplementedError("preserve_seams is not implemented")
+    tris = mesh["tris"]
+    threshold = mesh.get("threshold", 0.5)
+
+    adj = build_adjacency(tris)
+
+    seam_edges = set()
+    for pair in seams:
+        i, j = pair
+        seam_edges.add(_edge_key(i, j))
+
+    for key, inc in adj.items():
+        if len(inc) != 2 or key in seam_edges:
+            continue
+        t1, t2 = tris[inc[0]], tris[inc[1]]
+        uv1 = dict(zip(t1["v"], t1["uv"]))
+        uv2 = dict(zip(t2["v"], t2["uv"]))
+        for vtx in key:
+            a = uv1.get(vtx)
+            b = uv2.get(vtx)
+            if a is None or b is None:
+                continue
+            if abs(a[0] - b[0]) > EPS or abs(a[1] - b[1]) > EPS:
+                seam_edges.add(key)
+                break
+
+    candidates = {k: v for k, v in adj.items() if k not in seam_edges}
+    pairs = pair_triangles(tris, candidates, threshold)
+
+    quads = [merge_to_quad(tris[i], tris[j]) for i, j in pairs]
+    quads = fill_leftovers(quads, tris, adj)
+
+    counts = [0] * len(tris)
+    for quad in quads:
+        corners = set(quad)
+        for t, tri in enumerate(tris):
+            if set(tri["v"]) <= corners:
+                counts[t] += 1
+    coverage = (
+        sum(1 for c in counts if c == 1) / len(tris) if tris else 1.0
+    )
+
+    return {
+        "pairs": pairs,
+        "quads": quads,
+        "triangle_count": len(tris),
+        "coverage": coverage,
+    }
+
+
+# ---------------------------------------------------------------------------
+# validation
+# ---------------------------------------------------------------------------
+
+
+def _orient2(a, b, c):
+    return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+
+def _segments_cross(a, b, c, d):
+    o1 = _orient2(a, b, c)
+    o2 = _orient2(a, b, d)
+    o3 = _orient2(c, d, a)
+    o4 = _orient2(c, d, b)
+    return (o1 * o2 < -EPS) and (o3 * o4 < -EPS)
 
 
 def validate_quads(quads, positions) -> list[str]:
@@ -224,7 +473,72 @@ def validate_quads(quads, positions) -> list[str]:
 
     Conventions: quad winding is counter-clockwise, tolerance 1e-9.
     """
-    raise NotImplementedError("validate_quads is not implemented")
+    messages = []
+    n = len(positions)
+
+    for qi, quad in enumerate(quads):
+        # INDEX_OUT_OF_RANGE -- nothing else can be computed without points.
+        if any(i < 0 or i >= n for i in quad):
+            messages.append(
+                f"INDEX_OUT_OF_RANGE: quad {qi} references a vertex outside "
+                f"[0, {n})"
+            )
+            continue
+
+        pts = [positions[i] for i in quad]
+        degenerate = quad[0] == quad[3] and len(set(quad)) == 3
+
+        # DUPLICATE_VERTEX
+        if not degenerate and len(set(quad)) != 4:
+            messages.append(
+                f"DUPLICATE_VERTEX: quad {qi} repeats a vertex index"
+            )
+
+        # DEGENERATE_AREA
+        newell = _newell(pts)
+        area = 0.5 * _length(newell)
+        if area <= EPS:
+            messages.append(
+                f"DEGENERATE_AREA: quad {qi} has Newell area {area}"
+            )
+
+        # SELF_INTERSECTION, in the plane of the largest normal component.
+        axis = max(range(3), key=lambda k: abs(newell[k]))
+        flat = [tuple(p[k] for k in range(3) if k != axis) for p in pts]
+        edges = [(flat[k], flat[(k + 1) % 4]) for k in range(4)]
+
+        def zero_length(e):
+            dx = e[1][0] - e[0][0]
+            dy = e[1][1] - e[0][1]
+            return dx * dx + dy * dy <= EPS * EPS
+
+        for e1, e2 in ((0, 2), (1, 3)):
+            if zero_length(edges[e1]) or zero_length(edges[e2]):
+                continue
+            a, b = edges[e1]
+            c, d = edges[e2]
+            if _segments_cross(a, b, c, d):
+                messages.append(
+                    f"SELF_INTERSECTION: quad {qi} edges {e1} and {e2} cross"
+                )
+                break
+
+        # INCONSISTENT_WINDING (degenerate quads are skipped).
+        if not degenerate:
+            n_left = _cross(_sub(pts[1], pts[0]), _sub(pts[2], pts[0]))
+            n_right = _cross(_sub(pts[2], pts[0]), _sub(pts[3], pts[0]))
+            if _dot(n_left, n_right) <= 0.0:
+                messages.append(
+                    f"INCONSISTENT_WINDING: quad {qi} halves face opposite "
+                    f"ways"
+                )
+
+    return messages
+
+
+# ---------------------------------------------------------------------------
+# batch
+# ---------------------------------------------------------------------------
 
 
 def remesh_batch(meshes, config) -> dict:
@@ -248,4 +562,12 @@ def remesh_batch(meshes, config) -> dict:
 
     Conventions: batch state is independent per mesh, tolerance 1e-9.
     """
-    raise NotImplementedError("remesh_batch is not implemented")
+    config = config or {}
+    results = []
+    for mesh in meshes:
+        local = dict(mesh)
+        local["threshold"] = mesh.get(
+            "threshold", config.get("threshold", 0.5)
+        )
+        results.append(preserve_seams(local, mesh.get("seams", [])))
+    return {"meshes": results}
